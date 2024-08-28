@@ -408,7 +408,7 @@ def load_prompts(file_path):
     with open(file_path, 'r') as f:
         return [json.loads(line) for line in f if line.strip()]
 
-if __name__ == "__main__":
+def main():
     parser = argparse.ArgumentParser(description='Run benchmark on an API')
     parser.add_argument('--num_clients_list', type=int, nargs='+', help='List of concurrent clients to test with', default=[100, 50, 10, 5, 1])
     parser.add_argument('--job_length', type=int, help='Duration of the benchmark job in seconds', default=300)
@@ -425,3 +425,6 @@ if __name__ == "__main__":
 
     print(f"Running benchmark series with {args.num_clients_list} concurrent clients for {args.job_length} seconds each on {args.url} with model {args.model}...")
     asyncio.run(run_benchmark_series(args.num_clients_list, args.job_length, args.url, args.framework, args.model, args.run_name, args.ping_correction, args.enable_aimd, args.token, args.endpoint, args.use_prompt_field))
+
+if __name__ == "__main__":
+    main()
