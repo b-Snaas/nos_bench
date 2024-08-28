@@ -2,7 +2,7 @@ from setuptools import setup
 
 setup(
     name="lm-benchmark",
-    version="0.1.0",
+    version="0.1.1",
     py_modules=["lm_benchmark"],
     install_requires=[
         "aiohttp",
