@@ -66,7 +66,7 @@ class MetricsCollector:
                 tokens_per_second = self.total_tokens / (current_time - self.start_time)
                 self.time_series.append(report_time)
                 self.tokens_per_second_series.append(tokens_per_second)
-                self.print_report(report_time, tokens_per_second)
+                # self.print_report(report_time, tokens_per_second)
                 
                 if self.session_time and report_time >= self.session_time:
                     self.final_report()
