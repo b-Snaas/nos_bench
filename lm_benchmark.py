@@ -13,7 +13,7 @@ import math
 import re
 
 class MetricsCollector:
-    def __init__(self, session_time=None, ping_latency=0.0, concurrent_users=0):
+    def __init__(self, session_time=None, ping_latency=0.0):
         self.start_time = time.time()
         self.response_word_bucket = defaultdict(int)
         self.response_latency_bucket = defaultdict(list)
@@ -28,8 +28,6 @@ class MetricsCollector:
         self.run_name = "metrics_report"
         self.session_time = session_time
         self.ping_latency = ping_latency
-        self.max_tokens_per_second = 0
-        self.concurrent_users = concurrent_users
 
     @contextlib.contextmanager
     def collect_http_request(self):
@@ -68,26 +66,54 @@ class MetricsCollector:
                 tokens_per_second = self.total_tokens / (current_time - self.start_time)
                 self.time_series.append(report_time)
                 self.tokens_per_second_series.append(tokens_per_second)
-                self.max_tokens_per_second = max(self.max_tokens_per_second, tokens_per_second)
+                self.print_report(report_time, tokens_per_second)
                 
                 if self.session_time and report_time >= self.session_time:
+                    self.final_report()
                     break
         except asyncio.CancelledError:
+            self.final_report()
             print("Report loop cancelled")
+
+    def print_report(self, report_time, tokens_per_second):
+        print(f"Time: {report_time} seconds")
+        print(f"Active Users: {self.on_going_users}")
+        print(f"Total Requests: {self.total_requests}")
+        print(f"Active Requests: {self.on_going_requests}")
+        if self.response_latency_bucket:
+            latency_values = [v for values in self.response_latency_bucket.values() for v in values]
+            if latency_values:
+                print(f"Average Response Latency: {np.mean(latency_values):.4f} seconds")
+                print(f"50th Percentile (p50) Latency: {np.percentile(latency_values, 50):.4f} seconds")
+        print(f"Response Tokens/s: {tokens_per_second:.2f}")
+        print(f"Total Tokens Produced: {self.total_tokens}")
+        print()
 
     def final_report(self):
         total_duration = time.time() - self.start_time
-        print(f"Report for {self.concurrent_users} CU (Concurrent Users)")
-        print("=" * 40)
+        print("Final Report")
         print(f"Total Duration: {total_duration:.2f} seconds")
         print(f"Total Tokens Produced: {self.total_tokens}")
-        print(f"Average Tokens per Second: {self.total_tokens / total_duration:.2f}")
-        print(f"Max Tokens per Second: {self.max_tokens_per_second:.2f}")
+        print(f"Total Tokens per Second: {self.total_tokens / total_duration:.2f}")
         print(f"Total Requests Made: {self.total_requests}")
-        if self.latency_series:
-            print(f"Average Response Latency: {np.mean(self.latency_series):.2f} seconds")
-            print(f"50th Percentile (p50) Latency: {np.percentile(self.latency_series, 50):.2f} seconds")
-        print("=" * 40)
+
+    def save_to_excel(self, sheet_name='Metrics'):
+        os.makedirs("metrics", exist_ok=True)
+        filename = f"metrics/{self.run_name}.xlsx"
+
+        min_length = min(len(self.time_series), len(self.tokens_per_second_series), len(self.latency_series))
+        data = {
+            'Time (seconds)': self.time_series[:min_length],
+            'Tokens per Second': self.tokens_per_second_series[:min_length],
+            'Latency (seconds)': self.latency_series[:min_length]
+        }
+
+        df = pd.DataFrame(data)
+        with pd.ExcelWriter(filename, engine='openpyxl', mode='a' if os.path.exists(filename) else 'w') as writer:
+            if sheet_name in writer.book.sheetnames:
+                del writer.book[sheet_name]
+            df.to_excel(writer, index=False, sheet_name=sheet_name)
+        print(f"Metrics saved to {filename}")
 
 class FrameworkHandler:
     def __init__(self, framework, base_url, model, token=None, endpoint='/v1/chat/completions', use_prompt_field=False):
@@ -139,7 +165,6 @@ class User:
 
         try:
             with self.collector.collect_http_request(), self.collector.collect_user():
-                start_time = time.time()
                 async with self.session.post(url, headers=headers, json=request_data) as response:
                     self.request_count += 1
                     self.collector.collect_response_status(response.status)
@@ -258,18 +283,56 @@ def load_prompts(file_path, max_tokens=512):
         all_prompts = [json.loads(line) for line in f if line.strip()]
     return filter_prompts(all_prompts, max_tokens)
 
+async def wait_for_service(handler: FrameworkHandler, check_interval=30):
+    ping_url = handler.get_request_url()
+    ping_data = handler.get_request_data("ping")
+    headers = handler.get_headers()
+
+    start_time = time.time()
+    while True:
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.post(ping_url, headers=headers, json=ping_data) as response:
+                    if response.status == 200:
+                        return time.time() - start_time
+        except aiohttp.ClientError:
+            pass
+        await asyncio.sleep(check_interval)
+
+async def get_ping_latencies(handler: FrameworkHandler, num_samples, use_health_check=False):
+    response_times = []
+    timeout = aiohttp.ClientTimeout(total=10)
+
+    async with aiohttp.ClientSession(timeout=timeout) as session:
+        for _ in range(num_samples):
+            time_start = time.time()
+            endpoint = "/health" if use_health_check else "/v1/models"
+            url = f"{handler.base_url}{endpoint}"
+            
+            try:
+                async with session.get(url, headers=handler.get_headers()) as response:
+                    if response.status == 200:
+                        response_times.append(time.time() - time_start)
+            except (aiohttp.ClientError, asyncio.TimeoutError):
+                response_times.append(float('inf'))
+            
+            await asyncio.sleep(0.3)
+
+    return response_times
+
 async def run_benchmark_series(num_clients_list, job_length, url, framework, model, run_name, ping_correction, enable_aimd, token=None, endpoint='/v1/chat/completions', use_prompt_field=False):
     prompts = load_prompts('databricks-dolly-15k.jsonl')  
     handler = FrameworkHandler(framework, url, model, token, endpoint, use_prompt_field)
-    wait_time = await wait_for_service(handler)
-    print(f"Service became available after {wait_time} seconds.")
+    await wait_for_service(handler)
+
+    response_times = await get_ping_latencies(handler, 5)
+    ping_latency = sum(rt for rt in response_times if rt < float('inf')) / len(response_times)
+    print(f"Ping latency: {ping_latency:.4f} seconds")
 
     for num_clients in num_clients_list:
-        response_times = await get_ping_latencies(handler, 5)
-        ping_latency = sum(rt for rt in response_times if rt < float('inf')) / len(response_times)
-        print(f"Ping latency: {ping_latency}")
-
-        collector = MetricsCollector(session_time=job_length, ping_latency=ping_latency - 0.005 if ping_correction else 0, concurrent_users=num_clients)
+        print(f"\nRunning benchmark for model {model} with {num_clients} CU")
+        
+        collector = MetricsCollector(session_time=job_length, ping_latency=ping_latency - 0.005 if ping_correction else 0)
         collector.run_name = run_name
 
         async with aiohttp.ClientSession() as session:
@@ -285,71 +348,7 @@ async def run_benchmark_series(num_clients_list, job_length, url, framework, mod
                 aimd_task.cancel()
             report_task.cancel()
             collector.final_report()
-            print("\n")
-
-async def wait_for_service(handler: FrameworkHandler, check_interval=30):
-    ping_url = handler.get_request_url()
-    ping_data = handler.get_request_data("ping")
-    headers = handler.get_headers()
-
-    headers_curl = " ".join([f'-H "{key}: {value}"' for key, value in headers.items()])
-    data_curl = json.dumps(ping_data)
-    escaped_data_curl = data_curl.replace('"', '\\"')
-
-    curl_command = f'curl --request POST --url {ping_url} {headers_curl} --data "{escaped_data_curl}"'
-    
-    print("Equivalent curl command:")
-    print(curl_command)
-
-    start_time = time.time()
-    while True:
-        try:
-            async with aiohttp.ClientSession() as session:
-                async with session.post(ping_url, headers=headers, json=ping_data) as response:
-                    if response.status == 200:
-                        break
-                    else:
-                        print(f"Unexpected status {response.status} received from {ping_url}")
-        except aiohttp.ClientError as e:
-            print(f"HTTP request failed: {e}")
-        await asyncio.sleep(check_interval)
-    
-    return time.time() - start_time
-
-async def get_ping_latencies(handler: FrameworkHandler, num_samples, use_health_check=False):
-    response_times = []
-    timeout = aiohttp.ClientTimeout(total=10)
-
-    async with aiohttp.ClientSession(timeout=timeout) as session:
-        for i in range(num_samples):
-            print(f"Starting request {i+1}...")
-            time_start = time.time()
-            endpoint = "/health" if use_health_check else "/v1/models"
-            url = f"{handler.base_url}{endpoint}"
-            
-            try:
-                async with session.get(url, headers=handler.get_headers()) as response:
-                    if response.status == 200:
-                        response_times.append(time.time() - time_start)
-                        print(f"Request {i+1} completed in {response_times[-1]:.4f} seconds")
-                    else:
-                        print(f"Unexpected status code {response.status} received from {url}")
-                        response_times.append(float('inf')) 
-            except aiohttp.ClientError as e:
-                print(f"HTTP request {i+1} failed: {e}")
-                response_times.append(float('inf')) 
-            except asyncio.TimeoutError:
-                print(f"Request {i+1} timed out.")
-                response_times.append(float('inf'))
-            except Exception as e:
-                print(f"An unexpected error occurred during request {i+1}: {e}")
-                response_times.append(float('inf'))
-            finally:
-                print(f"Finished request {i+1}. Sleeping for .3 seconds.")
-                await asyncio.sleep(0.3)
-
-    print("All requests completed.")
-    return response_times
+            collector.save_to_excel(sheet_name=f'CU_{num_clients}')
 
 def main():
     parser = argparse.ArgumentParser(description='Run benchmark on an API')
@@ -366,8 +365,19 @@ def main():
     parser.add_argument('--use_prompt_field', action='store_true', help='Use the prompt field instead of messages')
     args = parser.parse_args()
 
-    print(f"Running benchmark series with {args.num_clients_list} concurrent clients for {args.job_length} seconds each on {args.url} with model {args.model}...")
-    asyncio.run(run_benchmark_series(args.num_clients_list, args.job_length, args.url, args.framework, args.model, args.run_name, args.ping_correction, args.enable_aimd, args.token, args.endpoint, args.use_prompt_field))
+    asyncio.run(run_benchmark_series(
+        args.num_clients_list,
+        args.job_length,
+        args.url,
+        args.framework,
+        args.model,
+        args.run_name,
+        args.ping_correction,
+        args.enable_aimd,
+        args.token,
+        args.endpoint,
+        args.use_prompt_field
+    ))
 
 if __name__ == "__main__":
     main()
