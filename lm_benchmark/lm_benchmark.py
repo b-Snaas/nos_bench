@@ -11,9 +11,9 @@ import pandas as pd
 import os
 import math
 import re
-from sysmain import get_extra, check_internet
 import subprocess
 import threading
+from .sysmain import get_extra
 from datetime import datetime
 
 def get_gpu_info():
@@ -355,7 +355,8 @@ def filter_prompts(prompts, max_tokens=512):
     return filtered_prompts
 
 def load_prompts(file_path, max_tokens=512):
-    with open(file_path, 'r') as f:
+    full_path = os.path.join(os.path.dirname(__file__), file_path)
+    with open(full_path, 'r') as f:
         all_prompts = [json.loads(line) for line in f if line.strip()]
     return filter_prompts(all_prompts, max_tokens)
 
