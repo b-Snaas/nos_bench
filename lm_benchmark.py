@@ -72,7 +72,9 @@ class GPUMonitor:
                 time.sleep(1)  # Wait a bit before trying again
 
     def get_gpu_stats(self, start_time, end_time):
-        relevant_data = [d for d in self.gpu_data if start_time <= datetime.fromisoformat(d['timestamp']) <= end_time]
+        start_time_dt = datetime.fromtimestamp(start_time)
+        end_time_dt = datetime.fromtimestamp(end_time)
+        relevant_data = [d for d in self.gpu_data if start_time_dt <= datetime.fromisoformat(d['timestamp']) <= end_time_dt]
         if relevant_data:
             stats = defaultdict(lambda: {'clock_speed': [], 'power_usage': [], 'utilization': []})
             for d in relevant_data:
@@ -166,7 +168,9 @@ class MetricsCollector:
         self.gpu_monitor.start_monitoring()
 
     def stop_gpu_monitoring(self):
-        self.gpu_monitor.stop_monitoring()
+        self.gpu_monitor.stop_monitoring.set()  # Set the Event to stop monitoring
+        if hasattr(self.gpu_monitor, 'monitoring_thread'):
+            self.gpu_monitor.monitoring_thread.join()  # Wait for the monitoring thread to finish
 
     def final_report(self):
         total_duration = time.time() - self.start_time
