@@ -11,6 +11,7 @@ import pandas as pd
 import os
 import math
 import re
+from sysmain import get_extra, check_internet
 
 class MetricsCollector:
     def __init__(self, session_time=None, ping_latency=0.0):
@@ -28,6 +29,8 @@ class MetricsCollector:
         self.run_name = "metrics_report"
         self.session_time = session_time
         self.ping_latency = ping_latency
+        self.last_report_time = self.start_time
+        self.last_report_tokens = 0
 
     @contextlib.contextmanager
     def collect_http_request(self):
@@ -63,57 +66,38 @@ class MetricsCollector:
                 await asyncio.sleep(time_window)
                 current_time = time.time()
                 report_time = int(current_time - self.start_time)
-                tokens_per_second = self.total_tokens / (current_time - self.start_time)
+                tokens_since_last_report = self.total_tokens - self.last_report_tokens
+                time_since_last_report = current_time - self.last_report_time
+                
+                if time_since_last_report > 0:
+                    current_throughput = tokens_since_last_report / time_since_last_report
+                
                 self.time_series.append(report_time)
-                self.tokens_per_second_series.append(tokens_per_second)
-                # self.print_report(report_time, tokens_per_second)
+                self.tokens_per_second_series.append(current_throughput)
+                
+                self.last_report_time = current_time
+                self.last_report_tokens = self.total_tokens
                 
                 if self.session_time and report_time >= self.session_time:
-                    self.final_report()
                     break
         except asyncio.CancelledError:
-            self.final_report()
-            print("Report loop cancelled")
-
-    def print_report(self, report_time, tokens_per_second):
-        print(f"Time: {report_time} seconds")
-        print(f"Active Users: {self.on_going_users}")
-        print(f"Total Requests: {self.total_requests}")
-        print(f"Active Requests: {self.on_going_requests}")
-        if self.response_latency_bucket:
-            latency_values = [v for values in self.response_latency_bucket.values() for v in values]
-            if latency_values:
-                print(f"Average Response Latency: {np.mean(latency_values):.4f} seconds")
-                print(f"50th Percentile (p50) Latency: {np.percentile(latency_values, 50):.4f} seconds")
-        print(f"Response Tokens/s: {tokens_per_second:.2f}")
-        print(f"Total Tokens Produced: {self.total_tokens}")
-        print()
+            pass
 
     def final_report(self):
-        total_duration = time.time() - self.start_time
-        print("Final Report")
-        print(f"Total Duration: {total_duration:.2f} seconds")
-        print(f"Total Tokens Produced: {self.total_tokens}")
-        print(f"Total Tokens per Second: {self.total_tokens / total_duration:.2f}")
-        print(f"Total Requests Made: {self.total_requests}")
-
-    def save_to_excel(self, sheet_name='Metrics'):
-        os.makedirs("metrics", exist_ok=True)
-        filename = f"metrics/{self.run_name}.xlsx"
-
-        min_length = min(len(self.time_series), len(self.tokens_per_second_series), len(self.latency_series))
-        data = {
-            'Time (seconds)': self.time_series[:min_length],
-            'Tokens per Second': self.tokens_per_second_series[:min_length],
-            'Latency (seconds)': self.latency_series[:min_length]
-        }
-
-        df = pd.DataFrame(data)
-        with pd.ExcelWriter(filename, engine='openpyxl', mode='a' if os.path.exists(filename) else 'w') as writer:
-            if sheet_name in writer.book.sheetnames:
-                del writer.book[sheet_name]
-            df.to_excel(writer, index=False, sheet_name=sheet_name)
-        print(f"Metrics saved to {filename}")
+            total_duration = time.time() - self.start_time
+            average_tokens_per_second = self.total_tokens / total_duration
+            
+            report = {
+                "total_duration": round(total_duration, 2),
+                "total_tokens_produced": self.total_tokens,
+                "average_tokens_per_second": round(average_tokens_per_second, 2),
+                "total_requests_made": self.total_requests,
+                "status_distribution": dict(self.status_bucket),
+                "average_latency": round(sum(self.latency_series) / len(self.latency_series), 2) if self.latency_series else None
+            }
+            
+            print(json.dumps(report, indent=2))
+            return report
 
 class FrameworkHandler:
     def __init__(self, framework, base_url, model, token=None, endpoint='/v1/chat/completions', use_prompt_field=False):
@@ -321,9 +305,14 @@ async def get_ping_latencies(handler: FrameworkHandler, num_samples, use_health_
     return response_times
 
 async def run_benchmark_series(num_clients_list, job_length, url, framework, model, run_name, ping_correction, enable_aimd, token=None, endpoint='/v1/chat/completions', use_prompt_field=False):
+    
+    print("Starting benchmark service...")
+
     prompts = load_prompts('databricks-dolly-15k.jsonl')  
     handler = FrameworkHandler(framework, url, model, token, endpoint, use_prompt_field)
     await wait_for_service(handler)
+
+    print("Testing latency...")
 
     response_times = await get_ping_latencies(handler, 5)
     ping_latency = sum(rt for rt in response_times if rt < float('inf')) / len(response_times)
@@ -348,7 +337,6 @@ async def run_benchmark_series(num_clients_list, job_length, url, framework, mod
                 aimd_task.cancel()
             report_task.cancel()
             collector.final_report()
-            collector.save_to_excel(sheet_name=f'CU_{num_clients}')
 
 def main():
     parser = argparse.ArgumentParser(description='Run benchmark on an API')
@@ -364,6 +352,10 @@ def main():
     parser.add_argument('--endpoint', type=str, help='API endpoint for the requests', default='/v1/chat/completions')
     parser.add_argument('--use_prompt_field', action='store_true', help='Use the prompt field instead of messages')
     args = parser.parse_args()
+
+    # Get the system specs before the benchmarking
+    sys_info = get_extra()
+    print(f"system specs: {sys_info['specs']}\n")
 
     asyncio.run(run_benchmark_series(
         args.num_clients_list,

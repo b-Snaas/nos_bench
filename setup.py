@@ -10,6 +10,8 @@ setup(
         "matplotlib",
         "pandas",
         "openpyxl",
+        "typer",
+        "speedtest-cli",
     ],
     entry_points={
         "console_scripts": [
